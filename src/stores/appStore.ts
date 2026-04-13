@@ -10,7 +10,7 @@ import {
   resolveThemeMode,
   unregisterCustomAccent,
 } from '@/themes';
-import type { MxuConfig, RecentlyClosedInstance, LegacyActionConfig } from '@/types/config';
+import type { MxuConfig, RecentlyClosedInstance } from '@/types/config';
 import {
   clampAddTaskPanelHeight,
   defaultAddTaskPanelHeight,
@@ -54,21 +54,9 @@ import {
   getCurrentControllerAndResource,
   isTaskCompatible,
 } from './helpers';
+import { clearPersistedRuntimeLogs, persistRuntimeLogs } from '@/utils/runtimeLogPersistence';
 // 从独立模块导入类型和辅助函数
 import type { AppState, LogEntry, TaskRunStatus } from './types';
-
-/** 向后兼容：将旧版单个 preAction 迁移为 preActions 数组 */
-function migratePreActions(
-  inst: { preActions?: ActionConfig[]; preAction?: LegacyActionConfig },
-): ActionConfig[] | undefined {
-  if (inst.preActions && inst.preActions.length > 0) {
-    return inst.preActions.map((a) => (a.id ? a : { ...a, id: generateId() }));
-  }
-  if (inst.preAction) {
-    return [{ ...inst.preAction, id: generateId() }];
-  }
-  return undefined;
-}
 
 function cleanOptionValues(
   optionValues: Record<string, OptionValue>,
@@ -134,6 +122,7 @@ export const useAppStore = create<AppState>()(
     backgroundOpacity: 50,
     confirmBeforeDelete: false,
     maxLogsPerInstance: 2000,
+    retainTodayLogsAfterRestart: false,
     customAccents: [],
     setTheme: (theme) => {
       set({ theme });
@@ -163,10 +152,24 @@ export const useAppStore = create<AppState>()(
       if (!isTauri()) patchWebUIAppearance({ backgroundOpacity: clamped });
     },
     setConfirmBeforeDelete: (enabled) => set({ confirmBeforeDelete: enabled }),
-    setMaxLogsPerInstance: (value) =>
+    setMaxLogsPerInstance: (value) => {
       set({
         maxLogsPerInstance: Math.max(100, Math.min(10000, Math.floor(value))),
-      }),
+      });
+      const state = get();
+      if (state.retainTodayLogsAfterRestart) {
+        persistRuntimeLogs(state.instanceLogs, state.maxLogsPerInstance);
+      }
+    },
+    setRetainTodayLogsAfterRestart: (enabled) => {
+      set({ retainTodayLogsAfterRestart: enabled });
+      const state = get();
+      if (enabled) {
+        persistRuntimeLogs(state.instanceLogs, state.maxLogsPerInstance);
+      } else {
+        clearPersistedRuntimeLogs();
+      }
+    },
     addCustomAccent: (accent) => {
       set((state) => ({
         customAccents: [...state.customAccents, accent],
@@ -381,7 +384,7 @@ export const useAppStore = create<AppState>()(
               optionValues: t.optionValues,
             })),
             schedulePolicies: instanceToClose.schedulePolicies,
-            preActions: instanceToClose.preActions,
+            preAction: instanceToClose.preAction,
           };
           // 添加到列表头部，并限制最大条目数
           newRecentlyClosed = [closedRecord, ...state.recentlyClosed].slice(0, MAX_RECENTLY_CLOSED);
@@ -520,12 +523,6 @@ export const useAppStore = create<AppState>()(
       instanceId: string,
       taskName: string,
       initialValues?: Record<string, string>,
-      taskOptions?: {
-        enabled?: boolean;
-        expanded?: boolean;
-        customName?: string;
-        switchOverrides?: Record<string, boolean>;
-      },
     ) => {
       // 从注册表获取特殊任务定义
       const specialTask = getMxuSpecialTask(taskName);
@@ -549,14 +546,9 @@ export const useAppStore = create<AppState>()(
           }
           optionValues[optionKey] = { type: 'input', values };
         } else if (optionDef.type === 'switch') {
-          const overridden = taskOptions?.switchOverrides?.[optionKey];
-          if (overridden !== undefined) {
-            optionValues[optionKey] = { type: 'switch', value: overridden };
-          } else {
-            const defaultCase = optionDef.default_case;
-            const isOn = defaultCase === 'Yes' || defaultCase === optionDef.cases[0]?.name;
-            optionValues[optionKey] = { type: 'switch', value: isOn };
-          }
+          const defaultCase = optionDef.default_case;
+          const isOn = defaultCase === 'Yes' || defaultCase === optionDef.cases[0]?.name;
+          optionValues[optionKey] = { type: 'switch', value: isOn };
         } else if (optionDef.type === 'checkbox') {
           const defaultCases = optionDef.default_case || [];
           optionValues[optionKey] = { type: 'checkbox', caseNames: [...defaultCases] };
@@ -571,10 +563,9 @@ export const useAppStore = create<AppState>()(
       const newTask: SelectedTask = {
         id: generateId(),
         taskName,
-        customName: taskOptions?.customName,
-        enabled: taskOptions?.enabled ?? true,
+        enabled: true,
         optionValues,
-        expanded: taskOptions?.expanded ?? true,
+        expanded: true,
       };
 
       set((state) => ({
@@ -604,9 +595,6 @@ export const useAppStore = create<AppState>()(
       set((state) => ({
         instances: state.instances.map((i) => {
           if (i.id !== instanceId) return i;
-          const len = i.selectedTasks.length;
-          if (oldIndex < 0 || oldIndex >= len || newIndex < 0 || newIndex >= len) return i;
-          if (oldIndex === newIndex) return i;
 
           const tasks = [...i.selectedTasks];
           const [removed] = tasks.splice(oldIndex, 1);
@@ -875,7 +863,7 @@ export const useAppStore = create<AppState>()(
           optionValues: { ...t.optionValues },
         })),
         isRunning: false,
-        preActions: sourceInstance.preActions?.map((a) => ({ ...a, id: generateId() })),
+        preAction: sourceInstance.preAction ? { ...sourceInstance.preAction } : undefined,
       };
 
       // 复制源实例的控制器和资源选择
@@ -1078,7 +1066,7 @@ export const useAppStore = create<AppState>()(
           selectedTasks: savedTasks,
           isRunning: prevRunningByInstance.get(inst.id) ?? false,
           schedulePolicies: inst.schedulePolicies,
-          preActions: migratePreActions(inst),
+          preAction: inst.preAction,
         };
       });
 
@@ -1168,6 +1156,7 @@ export const useAppStore = create<AppState>()(
         backgroundOpacity: effectiveBgOpacity,
         confirmBeforeDelete: config.settings.confirmBeforeDelete ?? false,
         maxLogsPerInstance: config.settings.maxLogsPerInstance ?? 2000,
+        retainTodayLogsAfterRestart: config.settings.retainTodayLogsAfterRestart ?? false,
         customAccents: effectiveCustomAccents,
         selectedController,
         selectedResource,
@@ -1366,78 +1355,11 @@ export const useAppStore = create<AppState>()(
         instances: state.instances.map((i) => (i.id === instanceId ? { ...i, savedDevice } : i)),
       })),
 
-    addPreAction: (instanceId: string, action: ActionConfig) =>
+    setInstancePreAction: (instanceId: string, action: ActionConfig | undefined) =>
       set((state) => ({
         instances: state.instances.map((i) =>
-          i.id === instanceId
-            ? { ...i, preActions: [...(i.preActions || []), action] }
-            : i,
+          i.id === instanceId ? { ...i, preAction: action } : i,
         ),
-      })),
-
-    updatePreAction: (instanceId: string, actionId: string, updates: Partial<ActionConfig>) =>
-      set((state) => ({
-        instances: state.instances.map((i) =>
-          i.id === instanceId
-            ? {
-                ...i,
-                preActions: i.preActions?.map((a) =>
-                  a.id === actionId ? { ...a, ...updates } : a,
-                ),
-              }
-            : i,
-        ),
-      })),
-
-    removePreAction: (instanceId: string, actionId: string) =>
-      set((state) => ({
-        instances: state.instances.map((i) => {
-          if (i.id !== instanceId) return i;
-          const filtered = i.preActions?.filter((a) => a.id !== actionId);
-          return { ...i, preActions: filtered?.length ? filtered : undefined };
-        }),
-      })),
-
-    reorderPreActions: (instanceId: string, oldIndex: number, newIndex: number) =>
-      set((state) => ({
-        instances: state.instances.map((i) => {
-          if (i.id !== instanceId || !i.preActions) return i;
-          const len = i.preActions.length;
-          if (oldIndex < 0 || oldIndex >= len || newIndex < 0 || newIndex >= len) return i;
-          if (oldIndex === newIndex) return i;
-          const items = [...i.preActions];
-          const [removed] = items.splice(oldIndex, 1);
-          items.splice(newIndex, 0, removed);
-          return { ...i, preActions: items };
-        }),
-      })),
-
-    renamePreAction: (instanceId: string, actionId: string, name: string) =>
-      set((state) => ({
-        instances: state.instances.map((i) =>
-          i.id === instanceId
-            ? {
-                ...i,
-                preActions: i.preActions?.map((a) =>
-                  a.id === actionId ? { ...a, customName: name || undefined } : a,
-                ),
-              }
-            : i,
-        ),
-      })),
-
-    duplicatePreAction: (instanceId: string, actionId: string) =>
-      set((state) => ({
-        instances: state.instances.map((i) => {
-          if (i.id !== instanceId || !i.preActions) return i;
-          const idx = i.preActions.findIndex((a) => a.id === actionId);
-          if (idx === -1) return i;
-          const source = i.preActions[idx];
-          const copy: ActionConfig = { ...source, id: generateId() };
-          const items = [...i.preActions];
-          items.splice(idx + 1, 0, copy);
-          return { ...i, preActions: items };
-        }),
       })),
 
     // 设备列表缓存
@@ -1765,7 +1687,7 @@ export const useAppStore = create<AppState>()(
         })),
         isRunning: false,
         schedulePolicies: closedInstance.schedulePolicies,
-        preActions: migratePreActions(closedInstance),
+        preAction: closedInstance.preAction,
       };
 
       // 恢复选中的控制器和资源状态
@@ -1888,22 +1810,34 @@ export const useAppStore = create<AppState>()(
           : DEFAULT_MAX_LOGS_PER_INSTANCE;
         const limit = Math.min(10000, Math.max(100, Math.floor(rawLimit)));
         const updatedLogs = [...logs, newLog].slice(-limit);
+        const nextLogs = {
+          ...state.instanceLogs,
+          [instanceId]: updatedLogs,
+        };
+        if (state.retainTodayLogsAfterRestart) {
+          persistRuntimeLogs(nextLogs, state.maxLogsPerInstance);
+        }
         return {
-          instanceLogs: {
-            ...state.instanceLogs,
-            [instanceId]: updatedLogs,
-          },
+          instanceLogs: nextLogs,
         };
       }),
 
     clearLogs: (instanceId) => {
       clearLogsOnBackend(instanceId);
-      set((state) => ({
-        instanceLogs: {
+      set((state) => {
+        const nextLogs = {
           ...state.instanceLogs,
           [instanceId]: [],
-        },
-      }));
+        };
+        if (state.retainTodayLogsAfterRestart) {
+          persistRuntimeLogs(nextLogs, state.maxLogsPerInstance);
+        } else {
+          clearPersistedRuntimeLogs(instanceId, state.maxLogsPerInstance);
+        }
+        return {
+          instanceLogs: nextLogs,
+        };
+      });
     },
 
     // 回调 ID 与名称的映射
@@ -1979,7 +1913,7 @@ function generateConfig(): MxuConfig {
         optionValues: t.optionValues,
       })),
       schedulePolicies: inst.schedulePolicies,
-      preActions: inst.preActions,
+      preAction: inst.preAction,
     })),
     // WebUI 模式下保留后端原始的外观 & 布局设置，避免覆盖桌面端偏好
     ...(() => {
@@ -1994,6 +1928,7 @@ function generateConfig(): MxuConfig {
           backgroundOpacity: ba?.backgroundOpacity ?? state.backgroundOpacity,
           confirmBeforeDelete: state.confirmBeforeDelete,
           maxLogsPerInstance: state.maxLogsPerInstance,
+          retainTodayLogsAfterRestart: state.retainTodayLogsAfterRestart,
           windowSize: bl?.windowSize ?? state.windowSize,
           windowPosition: bl?.windowPosition ?? state.windowPosition,
           showOptionPreview: bl?.showOptionPreview ?? state.showOptionPreview,
@@ -2079,6 +2014,7 @@ useAppStore.subscribe(
     }),
     confirmBeforeDelete: state.confirmBeforeDelete,
     maxLogsPerInstance: state.maxLogsPerInstance,
+    retainTodayLogsAfterRestart: state.retainTodayLogsAfterRestart,
     mirrorChyanSettings: state.mirrorChyanSettings,
     proxySettings: state.proxySettings,
     welcomeShownHash: state.welcomeShownHash,
